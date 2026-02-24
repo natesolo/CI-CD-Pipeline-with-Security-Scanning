@@ -1,6 +1,7 @@
 # Secure CI/CD Pipeline (Jenkins)
 
 What This Project does?
+
 This project automatically checks your code for security problems, builds your app into a Docker image, scans that image for vulnerabilities, and only deploys if everything is safe.
 
 This repository contains a security-focused Jenkins pipeline with:
