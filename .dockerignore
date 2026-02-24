@@ -1,0 +1,8 @@
+.git
+.gitignore
+Jenkinsfile
+README.md
+reports
+k8s
+tmp
+*.md

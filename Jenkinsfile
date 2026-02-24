@@ -8,11 +8,12 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     skipDefaultCheckout(true)
+    skipStagesAfterUnstable()
   }
 
   parameters {
     choice(name: 'DEPLOY_ENV', choices: ['staging', 'production'], description: 'Target deployment environment')
-    booleanParam(name: 'AUTO_DEPLOY', defaultValue: true, description: 'Deploy automatically after security gates pass')
+    booleanParam(name: 'AUTO_DEPLOY', defaultValue: false, description: 'Deploy automatically after security gates pass')
   }
 
   environment {
@@ -20,7 +21,13 @@ pipeline {
     IMAGE_NAME = 'secure-cicd-app'
     IMAGE_REPO = "${REGISTRY}/nathan/${IMAGE_NAME}"
     SONARQUBE_INSTANCE = 'sonarqube-server'
+
+    # Pin security tooling versions to reduce supply-chain drift.
+    DEPENDENCY_CHECK_IMAGE = 'owasp/dependency-check:12.1.0'
+    TRIVY_IMAGE = 'aquasec/trivy:0.59.1'
+
     DEP_CHECK_REPORT_DIR = "${WORKSPACE}/reports/dependency-check"
+    DEP_CHECK_DATA_DIR = "${WORKSPACE}/reports/dependency-check-data"
     TRIVY_REPORT_DIR = "${WORKSPACE}/reports/trivy"
   }
 
@@ -28,7 +35,16 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        sh 'git rev-parse --short HEAD > .git/short_sha'
+      }
+    }
+
+    stage('Set Build Metadata') {
+      steps {
+        script {
+          env.SHORT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+          env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.SHORT_SHA}"
+          env.K8S_NAMESPACE = params.DEPLOY_ENV == 'production' ? 'secure-cicd-prod' : 'secure-cicd-staging'
+        }
       }
     }
 
@@ -60,12 +76,18 @@ pipeline {
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
-          mkdir -p "${DEP_CHECK_REPORT_DIR}"
+          mkdir -p "${DEP_CHECK_REPORT_DIR}" "${DEP_CHECK_DATA_DIR}"
 
           docker run --rm \
-            -v "${WORKSPACE}":/src \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --read-only \
+            --tmpfs /tmp:rw,size=1g \
+            -v "${WORKSPACE}":/src:ro \
             -v "${DEP_CHECK_REPORT_DIR}":/report \
-            owasp/dependency-check:latest \
+            -v "${DEP_CHECK_DATA_DIR}":/usr/share/dependency-check/data \
+            "${DEPENDENCY_CHECK_IMAGE}" \
             --scan /src \
             --out /report \
             --format HTML \
@@ -82,11 +104,6 @@ pipeline {
 
     stage('Build Docker Image') {
       steps {
-        script {
-          env.SHORT_SHA = sh(script: 'cat .git/short_sha', returnStdout: true).trim()
-          env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.SHORT_SHA}"
-        }
-
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           docker build --pull --no-cache \
@@ -102,16 +119,23 @@ pipeline {
           set -euo pipefail
           mkdir -p "${TRIVY_REPORT_DIR}"
 
+          docker save "${IMAGE_REPO}:${IMAGE_TAG}" -o "${TRIVY_REPORT_DIR}/image.tar"
+
           docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "${TRIVY_REPORT_DIR}":/report \
-            aquasec/trivy:latest image \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --read-only \
+            --tmpfs /tmp:rw,size=1g \
+            -v "${TRIVY_REPORT_DIR}":/scan \
+            "${TRIVY_IMAGE}" image \
+            --input /scan/image.tar \
             --severity HIGH,CRITICAL \
             --ignore-unfixed \
             --format sarif \
-            --output /report/trivy-results.sarif \
-            --exit-code 1 \
-            "${IMAGE_REPO}:${IMAGE_TAG}"
+            --output /scan/trivy-results.sarif \
+            --timeout 10m \
+            --exit-code 1
         '''
       }
       post {
@@ -131,10 +155,22 @@ pipeline {
             set -euo pipefail
             echo "${REGISTRY_TOKEN}" | docker login "${REGISTRY}" -u "${REGISTRY_USERNAME}" --password-stdin
             docker push "${IMAGE_REPO}:${IMAGE_TAG}"
-            docker tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:latest"
-            docker push "${IMAGE_REPO}:latest"
             docker logout "${REGISTRY}"
           '''
+        }
+      }
+    }
+
+    stage('Production Approval') {
+      when {
+        allOf {
+          branch 'main'
+          expression { return params.AUTO_DEPLOY && params.DEPLOY_ENV == 'production' }
+        }
+      }
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          input message: 'Approve deployment to production?', ok: 'Deploy'
         }
       }
     }
@@ -152,9 +188,11 @@ pipeline {
             set -euo pipefail
             export KUBECONFIG="${KUBECONFIG_FILE}"
             export IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
+            export K8S_NAMESPACE="${K8S_NAMESPACE}"
+
             envsubst < k8s/deployment.yaml.tpl > k8s/deployment.yaml
             kubectl apply -f k8s/deployment.yaml
-            kubectl -n secure-cicd rollout status deployment/secure-cicd-app --timeout=180s
+            kubectl -n "${K8S_NAMESPACE}" rollout status deployment/secure-cicd-app --timeout=180s
           '''
         }
       }
@@ -164,7 +202,8 @@ pipeline {
   post {
     always {
       sh '''#!/usr/bin/env bash
-        docker image rm -f "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:latest" 2>/dev/null || true
+        docker image rm -f "${IMAGE_REPO}:${IMAGE_TAG}" 2>/dev/null || true
+        rm -f "${TRIVY_REPORT_DIR}/image.tar" 2>/dev/null || true
       '''
       cleanWs()
     }
