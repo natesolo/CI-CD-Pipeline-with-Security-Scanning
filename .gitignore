@@ -1,0 +1,46 @@
+# VCS
+.git/
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.kubeconfig
+id_rsa
+id_ed25519
+secrets/
+*.secrets.*
+
+# CI/CD outputs
+reports/
+.trivycache/
+*.sarif
+
+# Build artifacts
+build/
+dist/
+out/
+coverage/
+*.log
+
+# Language-specific common directories
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
